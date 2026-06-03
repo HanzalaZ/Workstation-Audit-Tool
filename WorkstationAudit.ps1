@@ -286,7 +286,12 @@ Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresse
     Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
 
 Write-Host "Identified Local Shared Network Drives:" -ForegroundColor Yellow
-Get-PSDrive -PSProvider FileSystem | Select-Object Name, DisplayRoot
+$NetworkDriveInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=4" -ErrorAction SilentlyContinue | Select-Object @{Name='Drive Letter';Expression={$_.DeviceID}}, @{Name='Remote Path';Expression={$_.ProviderName}}, @{Name='Volume Name';Expression={$_.VolumeName}}, @{Name='Free Space';Expression={if ($_.FreeSpace) {[Math]::Round($_.FreeSpace / 1GB, 2) + ' GB'} else {'N/A'}}}, @{Name='Total Size';Expression={if ($_.Size) {[Math]::Round($_.Size / 1GB, 2) + ' GB'} else {'N/A'}}}
+if ($NetworkDriveInfo) {
+    $NetworkDriveInfo | Format-Table -AutoSize
+} else {
+    Write-Host "No mapped network drives detected." -ForegroundColor Cyan
+}
 
 # Specific explicit validation for your target checklist drive letter
 Write-Host "`nVerifying Local R: Drive Mapping Status..." -ForegroundColor Yellow
