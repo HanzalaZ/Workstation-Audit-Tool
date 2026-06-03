@@ -1,0 +1,12 @@
+# Block local transcription or test log dumps generated during audits
+*.txt
+*.xml
+*.csv
+*.log
+
+# Block Windows environment caching files
+.DS_Store
+Thumbs.db
+
+# Block VS Code specific workspace configuration flags
+.vscode/
