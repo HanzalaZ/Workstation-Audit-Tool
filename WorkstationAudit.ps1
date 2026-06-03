@@ -2,8 +2,7 @@
 =================================================================================
   PORTABLE WORKSTATION AUDIT AUTOMATION SCRIPT
   Filename: WorkstationAudit.ps1
-  Matches: Workstation_Audit_Checklist - Copy.docx
-  Updated: June 1, 2026
+  Updated: June 3, 2026
 =================================================================================
 #>
 
