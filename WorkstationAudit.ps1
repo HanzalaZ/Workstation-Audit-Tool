@@ -27,7 +27,6 @@ $DetectedGPUs = if ($GPUList) {
     "No Video Controller Identified via WMI"
 }
 
-# Advanced RAM Generation Identification Logic
 $MemoryModule = Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object -First 1
 $RamSpeed = if ($MemoryModule) { $MemoryModule.Speed } else { 0 }
 $RamGeneration = "DDR3 or Older"
@@ -39,7 +38,6 @@ if ($RamSpeed -gt 0) {
     $RamGeneration = "Unknown (Check Registry / Task Manager)"
 }
 
-# Fallback-Proof Authoritative TPM Query
 $TpmCheck = Get-Tpm -ErrorAction SilentlyContinue
 $TpmPresent = "No / Not Found"
 $TpmVersion = "N/A (Check BIOS / Motherboard Settings)"
@@ -47,7 +45,6 @@ $TpmVersion = "N/A (Check BIOS / Motherboard Settings)"
 if ($TpmCheck -and $TpmCheck.TpmPresent) {
     $TpmPresent = "Yes"
     
-    # Grab version strings via WMI since we verified it physically exists
     $TpmWmi = Get-CimInstance -Namespace root\cimv2\security\microsofttpm -ClassName Win32_Tpm -ErrorAction SilentlyContinue
     if ($null -ne $TpmWmi) {
         $TpmVersion = "$($TpmWmi.SpecVersion) (Mfg Version: $($TpmWmi.ManufacturerVersion))"
@@ -83,7 +80,6 @@ Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Obj
     $FreeGB = [Math]::Round($LogicalDrive.FreeSpace / 1GB, 2)
     $UsedGB = [Math]::Round($TotalGB - $FreeGB, 2)
     
-    # Translate raw hardware enum properties or string definitions
     $DriveLabel = "SSD"
     if ($PhysicalDisks) {
         $PrimaryDisk = $PhysicalDisks | Where-Object {$_.DeviceId -eq 0} | Select-Object -First 1
