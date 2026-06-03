@@ -281,20 +281,69 @@ Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresse
     Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize
 
 Write-Host "Identified Local Shared Network Drives:" -ForegroundColor Yellow
-$NetworkDriveInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=4" -ErrorAction SilentlyContinue | Select-Object @{Name='Drive Letter';Expression={$_.DeviceID}}, @{Name='Remote Path';Expression={$_.ProviderName}}, @{Name='Volume Name';Expression={$_.VolumeName}}, @{Name='Free Space';Expression={if ($_.FreeSpace) {[Math]::Round($_.FreeSpace / 1GB, 2) + ' GB'} else {'N/A'}}}, @{Name='Total Size';Expression={if ($_.Size) {[Math]::Round($_.Size / 1GB, 2) + ' GB'} else {'N/A'}}}
-if ($NetworkDriveInfo) {
-    $NetworkDriveInfo | Format-Table -AutoSize
+
+# Method 1: Query the active session (Works for Standard or Non-Elevated Admin execution)
+$NetworkDriveInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=4" -ErrorAction SilentlyContinue | 
+    Select-Object @{Name='Drive Letter';Expression={$_.DeviceID}}, @{Name='Remote Path';Expression={$_.ProviderName}}, @{Name='Volume Name';Expression={$_.VolumeName}}, @{Name='Free Space';Expression={if ($_.FreeSpace) {[Math]::Round($_.FreeSpace / 1GB, 2) + ' GB'} else {'N/A'}}}, @{Name='Total Size';Expression={if ($_.Size) {[Math]::Round($_.Size / 1GB, 2) + ' GB'} else {'N/A'}}}
+
+# Method 2: Registry Fallback (Finds mapped network shares even if running elevated or under SYSTEM account)
+$RegDrives = @()
+try {
+    $NetworkRegPath = Get-ChildItem -Path "HKCU:\Network\" -ErrorAction SilentlyContinue
+    if ($NetworkRegPath) {
+        $RegDrives = $NetworkRegPath | ForEach-Object {
+            $DriveLetter = $_.PSChildName
+            $RemotePath = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).RemotePath
+            [PSCustomObject]@{
+                "Drive Letter" = "$($DriveLetter):"
+                "Remote Path"  = $RemotePath
+                "Volume Name"  = "Persistent Registry Mapping"
+                "Free Space"   = "N/A (Registry Path)"
+                "Total Size"   = "N/A (Registry Path)"
+            }
+        }
+    }
+} catch {
+    # Silently fail if registry can't be accessed
+}
+
+# Combine both methods for complete coverage (deduplicate by drive letter)
+$AllDrives = @()
+if ($NetworkDriveInfo) { $AllDrives += $NetworkDriveInfo }
+
+# Add registry drives only if not already found via WMI
+if ($RegDrives) {
+    $ExistingDrives = $AllDrives | Select-Object -ExpandProperty "Drive Letter"
+    $RegDrives | Where-Object { $ExistingDrives -notcontains $_."Drive Letter" } | ForEach-Object { $AllDrives += $_ }
+}
+
+if ($AllDrives) {
+    $AllDrives | Format-Table -AutoSize
 } else {
-    Write-Host "No mapped network drives detected." -ForegroundColor Cyan
+    Write-Host "No mapped network drives detected in active session or registry." -ForegroundColor Cyan
 }
 
 # Specific explicit validation for your target checklist drive letter
 Write-Host "`nVerifying Local R: Drive Mapping Status..." -ForegroundColor Yellow
 $TargetDrive = "R:"
+$DriveFound = $false
+
+# Check Method 1: Active PSDrive
 if (Get-PSDrive -Name $TargetDrive.Replace(":","") -ErrorAction SilentlyContinue) {
-    Write-Host "SUCCESS: Drive letter $TargetDrive is actively registered locally." -ForegroundColor Green
+    $DriveFound = $true
+}
+
+# Check Method 2: Registry persistence
+if (-not $DriveFound -and (Test-Path "HKCU:\Network\$($TargetDrive.Replace(':',''))" -ErrorAction SilentlyContinue)) {
+    $DriveFound = $true
+}
+
+if ($DriveFound) {
+    Write-Host "SUCCESS: Drive letter $TargetDrive is registered or mapped persistently for this user account." -ForegroundColor Green
 } else {
     Write-Warning "WARNING: Drive $TargetDrive is unmapped or experiencing a ghost runtime connection conflict."
+    Write-Host "  -> Verify this workstation is logged in with a domain account (not local account)" -ForegroundColor Yellow
+    Write-Host "  -> Check Network Connection Profile is set to 'Private' (not 'Public')" -ForegroundColor Yellow
 }
 
 Write-Host "`n=================================================================" -ForegroundColor Yellow
