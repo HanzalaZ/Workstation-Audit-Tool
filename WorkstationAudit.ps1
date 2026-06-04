@@ -15,6 +15,9 @@ Write-Host "=================================================================" -
 Write-Host "   RUNNING AUTOMATED CHECKLIST EXTRACTION MODULE..." -ForegroundColor Yellow
 Write-Host "=================================================================" -ForegroundColor Yellow
 
+# Enable $DebugOutput for verbose logging (set to $true for troubleshooting)
+$DebugOutput = $false
+
 # -------------------------------------------------------------------------------
 # SECTIONS 1 & 2: MACHINE IDENTIFICATION & HARDWARE
 # -------------------------------------------------------------------------------
@@ -337,8 +340,13 @@ Write-Host "Identified Local Shared Network Drives:" -ForegroundColor Yellow
 # Identify both the logged-in user and the account running the script
 $LoggedInUser = $ComputerSystem.UserName
 $ScriptRunningAs = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-Write-Host "  [Debug] Logged-in user  : $LoggedInUser" -ForegroundColor Gray
-Write-Host "  [Debug] Script running as: $ScriptRunningAs" -ForegroundColor Gray
+if ($DebugOutput) {
+    Write-Host "  [Debug] Logged-in user  : $LoggedInUser" -ForegroundColor Gray
+    Write-Host "  [Debug] Script running as: $ScriptRunningAs" -ForegroundColor Gray
+}
+
+# Extract drive letter format operation to variable for reusability
+$DriveLetterKey = ':'
 
 # Resolve the logged-in user's SID (needed to find their hive under HKU)
 $LoggedInSID = $null
@@ -348,6 +356,7 @@ if ($LoggedInUser) {
         $LoggedInSID = $NTAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch {
         Write-Host "  [Warn] Could not resolve SID for $LoggedInUser - falling back to all-profile scan" -ForegroundColor Yellow
+        if ($DebugOutput) { Write-Host "    Error: $($_.Exception.Message)" -ForegroundColor Gray }
     }
 }
 
@@ -379,45 +388,48 @@ if ($LoggedInSID) {
 }
 
 # Method 3: Scan all loaded user hives under HKU to catch any other mapped users
-$AllUserRegDrives = @()
+$AllUserRegDrives = [System.Collections.Generic.List[object]]::new()
 try {
     $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
         Where-Object { $_.PSChildName -match '^S-1-5-21-.*' -and $_.PSChildName -notlike "*_Classes" }
 
-    foreach ($Profile in $UserProfiles) {
+    foreach ($RegProfile in $UserProfiles) {
         # Skip the logged-in user - already handled in Method 2
-        if ($Profile.PSChildName -eq $LoggedInSID) { continue }
+        if ($RegProfile.PSChildName -eq $LoggedInSID) { continue }
         try {
-            $NetworkPath    = "$($Profile.PSPath)\Network"
+            $NetworkPath    = "$($RegProfile.PSPath)\Network"
             $NetworkRegPath = Get-ChildItem -Path $NetworkPath -ErrorAction SilentlyContinue
             if ($NetworkRegPath) {
                 $NetworkRegPath | ForEach-Object {
                     $DriveLetter = $_.PSChildName
                     $RemotePath  = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).RemotePath
-                    $AllUserRegDrives += [PSCustomObject]@{
-                        "Drive Letter" = "$($DriveLetter):"
+                    $AllUserRegDrives.Add([PSCustomObject]@{
+                        "Drive Letter" = "$($DriveLetter)$DriveLetterKey"
                         "Remote Path"  = if ($RemotePath) { $RemotePath } else { "Unknown" }
                         "Volume Name"  = "Other User Profile (HKU)"
                         "Free Space"   = "N/A"
                         "Total Size"   = "N/A"
-                    }
+                    })
                 }
             }
-        } catch { }
+        } catch {
+            if ($DebugOutput) { Write-Host "    Error scanning $($RegProfile.PSChildName): $($_.Exception.Message)" -ForegroundColor Gray }
+        }
     }
-} catch { }
+} catch {
+    Write-Host "  [Warn] Error scanning user profiles in HKU" -ForegroundColor Yellow
+    if ($DebugOutput) { Write-Host "    Error: $($_.Exception.Message)" -ForegroundColor Gray }
+}
 
 # Merge all three methods, deduplicating by drive letter
 # Priority: WMI (has live size data) > HKU SID > other profiles
-$FinalDrives   = @()
-$SeenLetters   = @()
+$FinalDrives   = [System.Collections.Generic.List[object]]::new()
+$SeenLetters   = [System.Collections.Generic.HashSet[string]]::new()
 
 foreach ($Drive in (@($WMIDrives) + @($HKUDrives) + @($AllUserRegDrives))) {
-    if ($null -eq $Drive) { continue }
     $Letter = $Drive."Drive Letter"
-    if ($SeenLetters -notcontains $Letter) {
-        $FinalDrives += $Drive
-        $SeenLetters += $Letter
+    if ($SeenLetters.Add($Letter)) {
+        $FinalDrives.Add($Drive)
     }
 }
 
@@ -435,21 +447,24 @@ $TargetDrive = "R:"
 $DriveFound  = $false
 $DriveSource = ""
 
+# Extract target drive registry key (letter without colon) for reusability
+$TargetDriveKey = $TargetDrive.Replace($DriveLetterKey, "")
+
 # Check 1: Already found in our combined results above
-if ($SeenLetters -contains $TargetDrive) {
+if ($SeenLetters.Contains($TargetDrive)) {
     $DriveFound  = $true
     $DriveSource = "found via drive scan above"
 }
 
 # Check 2: Active PSDrive in current session
-if (-not $DriveFound -and (Get-PSDrive -Name $TargetDrive.Replace(":","") -ErrorAction SilentlyContinue)) {
+if (-not $DriveFound -and (Get-PSDrive -Name $TargetDriveKey -ErrorAction SilentlyContinue)) {
     $DriveFound  = $true
     $DriveSource = "active PSDrive in current session"
 }
 
 # Check 3: Logged-in user's HKU hive (direct SID lookup)
 if (-not $DriveFound -and $LoggedInSID) {
-    $HKURPath = "Registry::HKEY_USERS\$LoggedInSID\Network\$($TargetDrive.Replace(':',''))"
+    $HKURPath = "Registry::HKEY_USERS\$LoggedInSID\Network\$TargetDriveKey"
     if (Test-Path $HKURPath -ErrorAction SilentlyContinue) {
         $DriveFound  = $true
         $DriveSource = "logged-in user registry (HKU SID)"
@@ -457,25 +472,29 @@ if (-not $DriveFound -and $LoggedInSID) {
 }
 
 # Check 4: HKCU of the current session
-if (-not $DriveFound -and (Test-Path "HKCU:\Network\$($TargetDrive.Replace(':',''))" -ErrorAction SilentlyContinue)) {
+if (-not $DriveFound -and (Test-Path "HKCU:\Network\$TargetDriveKey" -ErrorAction SilentlyContinue)) {
     $DriveFound  = $true
     $DriveSource = "current session HKCU registry"
 }
 
-# Check 5: Any other loaded user profile in HKU
+# Check 5: Any other loaded user profile in HKU (reusing $UserProfiles from earlier scans)
 if (-not $DriveFound) {
     try {
-        $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
-            Where-Object { $_.PSChildName -match '^S-1-5-21-.*' -and $_.PSChildName -notlike "*_Classes" }
-        foreach ($Profile in $UserProfiles) {
-            $RDrivePath = "$($Profile.PSPath)\Network\$($TargetDrive.Replace(':',''))"
+        if (-not $UserProfiles) {
+            $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -match '^S-1-5-21-.*' -and $_.PSChildName -notlike "*_Classes" }
+        }
+        foreach ($RegProfile in $UserProfiles) {
+            $RDrivePath = "$($RegProfile.PSPath)\Network\$TargetDriveKey"
             if (Test-Path -Path $RDrivePath -ErrorAction SilentlyContinue) {
                 $DriveFound  = $true
-                $DriveSource = "other user profile in HKU ($($Profile.PSChildName))"
+                $DriveSource = "other user profile in HKU ($($RegProfile.PSChildName))"
                 break
             }
         }
-    } catch { }
+    } catch {
+        if ($DebugOutput) { Write-Host "    Error in final profile check: $($_.Exception.Message)" -ForegroundColor Gray }
+    }
 }
 
 if ($DriveFound) {
