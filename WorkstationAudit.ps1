@@ -26,7 +26,10 @@ $CPU = Get-CimInstance -ClassName Win32_Processor
 # Advanced GPU / Video Controller Detection (Reverted to Original Name/Driver)
 $GPUList = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
 $DetectedGPUs = if ($GPUList) {
-    ($GPUList | ForEach-Object { "$($_.Name) (Driver: $($_.DriverVersion))" }) -join " | "
+    ($GPUList | ForEach-Object { 
+        $VRAM_GB = if ($_.AdapterRAM) { [Math]::Round($_.AdapterRAM / 1GB, 2) } else { "Unknown" }
+        "$($_.Name) (VRAM: $VRAM_GB GB, Driver: $($_.DriverVersion))" 
+    }) -join " | "
 } else {
     "No Video Controller Identified via WMI"
 }
@@ -36,7 +39,9 @@ $RamSpeed = if ($MemoryModule) { $MemoryModule.Speed } else { 0 }
 $RamGeneration = "Unknown"
 
 # Use SMBIOS Memory Type for accurate identification (not speed-based)
-# SMBIOS values: 20=DDR, 21=DDR2, 24=DDR3, 26=DDR4, 29=LPDDR, 30=LPDDR4, 31=LPDDR5, 34=DDR5, others=Unknown
+# SMBIOS types: 20=DDR, 21=DDR2, 24=DDR3, 26=DDR4, 27=LPDDR, 28=LPDDR2, 29=LPDDR3,
+# 30=LPDDR4, 31=LPDDR5, 32=CAMM DDR4, 33=CAMM DDR5, 34=DDR5, 35=LPDDR5X,
+# 40=HBM, 41=HBM2, 42=HBM2E, 43=HBM3, 45=DDR5X, 46=LPDDR6, others=Unknown
 if ($MemoryModule -and $MemoryModule.SMBIOSMemoryType) {
     $MemType = $MemoryModule.SMBIOSMemoryType
     switch ($MemType) {
@@ -44,10 +49,17 @@ if ($MemoryModule -and $MemoryModule.SMBIOSMemoryType) {
         21  { $RamGeneration = "DDR2" }
         24  { $RamGeneration = "DDR3" }
         26  { $RamGeneration = "DDR4" }
-        29  { $RamGeneration = "LPDDR" }
+        27  { $RamGeneration = "LPDDR" }
+        28  { $RamGeneration = "LPDDR2" }
+        29  { $RamGeneration = "LPDDR3" }
         30  { $RamGeneration = "LPDDR4" }
         31  { $RamGeneration = "LPDDR5" }
+        32  { $RamGeneration = "DDR4 All-In-One (CAMM)" }
+        33  { $RamGeneration = "DDR5 All-In-One (CAMM2)" }
         34  { $RamGeneration = "DDR5" }
+        35  { $RamGeneration = "LPDDR5X" }
+        45  { $RamGeneration = "DDR5X" }
+        46  { $RamGeneration = "LPDDR6" }
         default { $RamGeneration = "Unknown / Other (SMBIOS Type: $MemType)" }
     }
 } else {
