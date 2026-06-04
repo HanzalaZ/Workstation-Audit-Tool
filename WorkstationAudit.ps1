@@ -2,7 +2,11 @@
 =================================================================================
   PORTABLE WORKSTATION AUDIT AUTOMATION SCRIPT
   Filename: WorkstationAudit.ps1
-  Updated: June 3, 2026
+  Updated: June 4, 2026
+  Fixes Applied:
+    - Corrected [ADSISearcher] typo (was [ADISearher]) in Domain/OU lookup
+    - Replaced network drive detection with HKU SID-based lookup so drives
+      mapped by the logged-in user are visible even when script runs as Admin
 =================================================================================
 #>
 
@@ -29,13 +33,22 @@ $DetectedGPUs = if ($GPUList) {
 
 $MemoryModule = Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object -First 1
 $RamSpeed = if ($MemoryModule) { $MemoryModule.Speed } else { 0 }
-$RamGeneration = "DDR3 or Older"
+$RamGeneration = "Unknown"
 
-if ($RamSpeed -gt 0) {
-    if ($RamSpeed -le 3200) { $RamGeneration = "DDR4" }
-    elseif ($RamSpeed -gt 3200) { $RamGeneration = "DDR5" }
+# Use SMBIOS Memory Type for accurate identification (not speed-based)
+# SMBIOS values: 20=DDR, 21=DDR2, 24=DDR3, 26=DDR4, 34=DDR5, others=Unknown
+if ($MemoryModule -and $MemoryModule.SMBIOSMemoryType) {
+    $MemType = $MemoryModule.SMBIOSMemoryType
+    switch ($MemType) {
+        20  { $RamGeneration = "DDR" }
+        21  { $RamGeneration = "DDR2" }
+        24  { $RamGeneration = "DDR3" }
+        26  { $RamGeneration = "DDR4" }
+        34  { $RamGeneration = "DDR5" }
+        default { $RamGeneration = "Unknown / Other (SMBIOS Type: $MemType)" }
+    }
 } else {
-    $RamGeneration = "Unknown (Check Registry / Task Manager)"
+    $RamGeneration = "Unknown (Check BIOS or Device Manager)"
 }
 
 $TpmCheck = Get-Tpm -ErrorAction SilentlyContinue
@@ -127,7 +140,8 @@ $OU = "N/A"
 if ($ComputerSystem.PartOfDomain) {
     $DomainJoined = "Yes"
     try {
-        $ComputerSearcher = [ADISearher]"(&(objectCategory=computer)(name=$env:COMPUTERNAME))"
+        # FIX: Corrected typo - was [ADISearher] which caused a crash on domain-joined machines
+        $ComputerSearcher = [ADSISearcher]"(&(objectCategory=computer)(name=$env:COMPUTERNAME))"
         $ResolveObject = $ComputerSearcher.FindOne()
         if ($ResolveObject) {
             $MachineDN = $ResolveObject.Path
@@ -293,130 +307,172 @@ Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresse
 
 Write-Host "Identified Local Shared Network Drives:" -ForegroundColor Yellow
 
-# Display current execution context (for admin-elevation troubleshooting)
-$CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-Write-Host "  [Debug] Currently running as: $CurrentUser" -ForegroundColor Gray
+# -------------------------------------------------------------------------------
+# FIX: Network Drive Detection Rewritten for Admin Session Compatibility
+#
+# When running as Admin, Windows creates a separate elevated session that does NOT
+# inherit the logged-in user's mapped drives. The fix resolves the actual logged-in
+# user's SID and reads their drive mappings directly from HKEY_USERS in the registry,
+# which IS accessible from an admin context. Three methods are combined:
+#   Method 1: WMI  - works when drives are live and visible in the current session
+#   Method 2: HKU SID lookup  - reads the logged-in user's hive directly (main fix)
+#   Method 3: All user profiles  - catches any other user with drives mapped on login
+# -------------------------------------------------------------------------------
 
-# Method 1: Query the active session (Works for Standard or Non-Elevated Admin execution)
-$NetworkDriveInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=4" -ErrorAction SilentlyContinue | 
-    Select-Object @{Name='Drive Letter';Expression={$_.DeviceID}}, @{Name='Remote Path';Expression={$_.ProviderName}}, @{Name='Volume Name';Expression={$_.VolumeName}}, @{Name='Free Space';Expression={if ($_.FreeSpace) {[Math]::Round($_.FreeSpace / 1GB, 2) + ' GB'} else {'N/A'}}}, @{Name='Total Size';Expression={if ($_.Size) {[Math]::Round($_.Size / 1GB, 2) + ' GB'} else {'N/A'}}}
+# Identify both the logged-in user and the account running the script
+$LoggedInUser = $ComputerSystem.UserName
+$ScriptRunningAs = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+Write-Host "  [Debug] Logged-in user  : $LoggedInUser" -ForegroundColor Gray
+Write-Host "  [Debug] Script running as: $ScriptRunningAs" -ForegroundColor Gray
 
-# Method 2: Registry Fallback - Query HKCU (current user's registry hive)
-$RegDrives = @()
-try {
-    $NetworkRegPath = Get-ChildItem -Path "HKCU:\Network\" -ErrorAction SilentlyContinue
-    if ($NetworkRegPath) {
-        $RegDrives = $NetworkRegPath | ForEach-Object {
-            $DriveLetter = $_.PSChildName
+# Resolve the logged-in user's SID (needed to find their hive under HKU)
+$LoggedInSID = $null
+if ($LoggedInUser) {
+    try {
+        $NTAccount  = New-Object System.Security.Principal.NTAccount($LoggedInUser)
+        $LoggedInSID = $NTAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        Write-Host "  [Warn] Could not resolve SID for $LoggedInUser - falling back to all-profile scan" -ForegroundColor Yellow
+    }
+}
+
+# Method 1: WMI query (works when the admin session can see live drive connections)
+$WMIDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=4" -ErrorAction SilentlyContinue |
+    Select-Object @{Name='Drive Letter'; Expression={$_.DeviceID}},
+                  @{Name='Remote Path';  Expression={$_.ProviderName}},
+                  @{Name='Volume Name';  Expression={$_.VolumeName}},
+                  @{Name='Free Space';   Expression={if ($_.FreeSpace) { [Math]::Round($_.FreeSpace / 1GB, 2).ToString() + ' GB' } else { 'N/A' }}},
+                  @{Name='Total Size';   Expression={if ($_.Size)      { [Math]::Round($_.Size      / 1GB, 2).ToString() + ' GB' } else { 'N/A' }}}
+
+# Method 2: Read the logged-in user's mapped drives directly from HKU using their SID
+# This is the primary fix - visible from admin session even when WMI returns nothing
+$HKUDrives = @()
+if ($LoggedInSID) {
+    $HKUNetworkPath = "Registry::HKEY_USERS\$LoggedInSID\Network"
+    if (Test-Path $HKUNetworkPath -ErrorAction SilentlyContinue) {
+        $HKUDrives = Get-ChildItem -Path $HKUNetworkPath -ErrorAction SilentlyContinue | ForEach-Object {
             $RemotePath = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).RemotePath
             [PSCustomObject]@{
-                "Drive Letter" = "$($DriveLetter):"
-                "Remote Path"  = $RemotePath
-                "Volume Name"  = "User Registry Mapping (HKCU)"
-                "Free Space"   = "N/A (Registry Path)"
-                "Total Size"   = "N/A (Registry Path)"
+                "Drive Letter" = "$($_.PSChildName):"
+                "Remote Path"  = if ($RemotePath) { $RemotePath } else { "Unknown" }
+                "Volume Name"  = "Mapped (logged-in user registry)"
+                "Free Space"   = "N/A"
+                "Total Size"   = "N/A"
             }
         }
     }
-} catch {
-    # Silently fail if registry can't be accessed
 }
 
-# Method 3: Scan ALL user profiles in registry (for admin-elevated contexts)
-# This finds drives mapped by any user on the system
+# Method 3: Scan all loaded user hives under HKU to catch any other mapped users
 $AllUserRegDrives = @()
 try {
-    $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | 
+    $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
         Where-Object { $_.PSChildName -match '^S-1-5-21-.*' -and $_.PSChildName -notlike "*_Classes" }
-    
+
     foreach ($Profile in $UserProfiles) {
+        # Skip the logged-in user - already handled in Method 2
+        if ($Profile.PSChildName -eq $LoggedInSID) { continue }
         try {
-            $NetworkPath = "$($Profile.PSPath)\Network"
+            $NetworkPath    = "$($Profile.PSPath)\Network"
             $NetworkRegPath = Get-ChildItem -Path $NetworkPath -ErrorAction SilentlyContinue
             if ($NetworkRegPath) {
                 $NetworkRegPath | ForEach-Object {
                     $DriveLetter = $_.PSChildName
-                    $RemotePath = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).RemotePath
+                    $RemotePath  = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).RemotePath
                     $AllUserRegDrives += [PSCustomObject]@{
                         "Drive Letter" = "$($DriveLetter):"
-                        "Remote Path"  = $RemotePath
-                        "Volume Name"  = "User Profile Registry"
-                        "Free Space"   = "N/A (Registry Path)"
-                        "Total Size"   = "N/A (Registry Path)"
+                        "Remote Path"  = if ($RemotePath) { $RemotePath } else { "Unknown" }
+                        "Volume Name"  = "Other User Profile (HKU)"
+                        "Free Space"   = "N/A"
+                        "Total Size"   = "N/A"
                     }
                 }
             }
-        } catch {
-            # Skip profiles that can't be accessed
-        }
+        } catch { }
     }
-} catch {
-    # Silently fail if HKU scan can't be accessed
+} catch { }
+
+# Merge all three methods, deduplicating by drive letter
+# Priority: WMI (has live size data) > HKU SID > other profiles
+$FinalDrives   = @()
+$SeenLetters   = @()
+
+foreach ($Drive in (@($WMIDrives) + @($HKUDrives) + @($AllUserRegDrives))) {
+    if ($null -eq $Drive) { continue }
+    $Letter = $Drive."Drive Letter"
+    if ($SeenLetters -notcontains $Letter) {
+        $FinalDrives += $Drive
+        $SeenLetters += $Letter
+    }
 }
 
-# Combine all methods for complete coverage (deduplicate by drive letter)
-$AllDrives = @()
-if ($NetworkDriveInfo) { $AllDrives += $NetworkDriveInfo }
-
-# Add registry drives only if not already found via WMI
-if ($RegDrives) {
-    $ExistingDrives = $AllDrives | Select-Object -ExpandProperty "Drive Letter"
-    $RegDrives | Where-Object { $ExistingDrives -notcontains $_."Drive Letter" } | ForEach-Object { $AllDrives += $_ }
-}
-
-# Add user profile drives only if not already found
-if ($AllUserRegDrives) {
-    $ExistingDrives = $AllDrives | Select-Object -ExpandProperty "Drive Letter"
-    $AllUserRegDrives | Where-Object { $ExistingDrives -notcontains $_."Drive Letter" } | ForEach-Object { $AllDrives += $_ }
-}
-
-if ($AllDrives) {
-    $AllDrives | Format-Table -AutoSize
+if ($FinalDrives) {
+    $FinalDrives | Format-Table -AutoSize
 } else {
-    Write-Host "No mapped network drives detected in active session or registry." -ForegroundColor Cyan
+    Write-Host "No mapped network drives detected for any user on this machine." -ForegroundColor Cyan
 }
 
-# Specific explicit validation for your target checklist drive letter
+# -------------------------------------------------------------------------------
+# Specific explicit validation for your target checklist drive letter (R:)
+# -------------------------------------------------------------------------------
 Write-Host "`nVerifying Local R: Drive Mapping Status..." -ForegroundColor Yellow
 $TargetDrive = "R:"
-$DriveFound = $false
+$DriveFound  = $false
+$DriveSource = ""
 
-# Check Method 1: Active PSDrive
-if (Get-PSDrive -Name $TargetDrive.Replace(":","") -ErrorAction SilentlyContinue) {
-    $DriveFound = $true
+# Check 1: Already found in our combined results above
+if ($SeenLetters -contains $TargetDrive) {
+    $DriveFound  = $true
+    $DriveSource = "found via drive scan above"
 }
 
-# Check Method 2: Registry persistence in HKCU
+# Check 2: Active PSDrive in current session
+if (-not $DriveFound -and (Get-PSDrive -Name $TargetDrive.Replace(":","") -ErrorAction SilentlyContinue)) {
+    $DriveFound  = $true
+    $DriveSource = "active PSDrive in current session"
+}
+
+# Check 3: Logged-in user's HKU hive (direct SID lookup)
+if (-not $DriveFound -and $LoggedInSID) {
+    $HKURPath = "Registry::HKEY_USERS\$LoggedInSID\Network\$($TargetDrive.Replace(':',''))"
+    if (Test-Path $HKURPath -ErrorAction SilentlyContinue) {
+        $DriveFound  = $true
+        $DriveSource = "logged-in user registry (HKU SID)"
+    }
+}
+
+# Check 4: HKCU of the current session
 if (-not $DriveFound -and (Test-Path "HKCU:\Network\$($TargetDrive.Replace(':',''))" -ErrorAction SilentlyContinue)) {
-    $DriveFound = $true
+    $DriveFound  = $true
+    $DriveSource = "current session HKCU registry"
 }
 
-# Check Method 3: Scan all user profiles in registry (for admin contexts)
+# Check 5: Any other loaded user profile in HKU
 if (-not $DriveFound) {
     try {
-        $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | 
+        $UserProfiles = Get-ChildItem -Path "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
             Where-Object { $_.PSChildName -match '^S-1-5-21-.*' -and $_.PSChildName -notlike "*_Classes" }
-        
         foreach ($Profile in $UserProfiles) {
             $RDrivePath = "$($Profile.PSPath)\Network\$($TargetDrive.Replace(':',''))"
             if (Test-Path -Path $RDrivePath -ErrorAction SilentlyContinue) {
-                $DriveFound = $true
+                $DriveFound  = $true
+                $DriveSource = "other user profile in HKU ($($Profile.PSChildName))"
                 break
             }
         }
-    } catch {
-        # Continue if HKU scan fails
-    }
+    } catch { }
 }
 
 if ($DriveFound) {
-    Write-Host "SUCCESS: Drive letter $TargetDrive is registered or mapped persistently for this user account." -ForegroundColor Green
+    Write-Host "SUCCESS: Drive $TargetDrive is mapped ($DriveSource)." -ForegroundColor Green
 } else {
     Write-Warning "WARNING: Drive $TargetDrive is unmapped or experiencing a ghost runtime connection conflict."
-    Write-Host "  -> This script is running as: $CurrentUser" -ForegroundColor Yellow
-    Write-Host "  -> Mapped drives are stored per-user - verify this account has the drives mapped" -ForegroundColor Yellow
-    Write-Host "  -> If running as Admin, drives may only be visible to the logged-in user (not admin context)" -ForegroundColor Yellow
-    Write-Host "  -> Check Network Connection Profile is set to 'Private' (not 'Public')" -ForegroundColor Yellow
+    Write-Host "  -> Logged-in user     : $LoggedInUser" -ForegroundColor Yellow
+    Write-Host "  -> Script running as  : $ScriptRunningAs" -ForegroundColor Yellow
+    Write-Host "  -> Mapped drives are stored per-user - verify this account has the drive mapped" -ForegroundColor Yellow
+    Write-Host "  -> If running as Admin, drives may only be visible to the logged-in user, not the admin session" -ForegroundColor Yellow
+    Write-Host "  -> Check Network Connection Profile is set to 'Private' or 'Domain' (not 'Public')" -ForegroundColor Yellow
+    Write-Host "  -> Try running 'gpupdate /force' logged in as the affected user to re-apply drive mappings" -ForegroundColor Yellow
 }
 
 Write-Host "`n=================================================================" -ForegroundColor Yellow
