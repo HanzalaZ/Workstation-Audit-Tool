@@ -36,7 +36,7 @@ $RamSpeed = if ($MemoryModule) { $MemoryModule.Speed } else { 0 }
 $RamGeneration = "Unknown"
 
 # Use SMBIOS Memory Type for accurate identification (not speed-based)
-# SMBIOS values: 20=DDR, 21=DDR2, 24=DDR3, 26=DDR4, 34=DDR5, others=Unknown
+# SMBIOS values: 20=DDR, 21=DDR2, 24=DDR3, 26=DDR4, 29=LPDDR, 30=LPDDR4, 31=LPDDR5, 34=DDR5, others=Unknown
 if ($MemoryModule -and $MemoryModule.SMBIOSMemoryType) {
     $MemType = $MemoryModule.SMBIOSMemoryType
     switch ($MemType) {
@@ -44,6 +44,9 @@ if ($MemoryModule -and $MemoryModule.SMBIOSMemoryType) {
         21  { $RamGeneration = "DDR2" }
         24  { $RamGeneration = "DDR3" }
         26  { $RamGeneration = "DDR4" }
+        29  { $RamGeneration = "LPDDR" }
+        30  { $RamGeneration = "LPDDR4" }
+        31  { $RamGeneration = "LPDDR5" }
         34  { $RamGeneration = "DDR5" }
         default { $RamGeneration = "Unknown / Other (SMBIOS Type: $MemType)" }
     }
