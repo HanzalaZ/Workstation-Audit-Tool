@@ -311,9 +311,15 @@ Write-Host "`n[+] SECTION 9: TOPOGRAPHY LAYOUTS & STORAGE PATHS" -ForegroundColo
 
 Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*"} | ForEach-Object {
     $Adapter = Get-NetAdapter -Name $_.InterfaceAlias -ErrorAction SilentlyContinue
+    
+    # Get the default gateway for this adapter
+    $Gateway = (Get-NetRoute -InterfaceAlias $_.InterfaceAlias -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
+    
     [PSCustomObject]@{
         "Network Card"   = $_.InterfaceAlias
         "IPv4 Address"   = $_.IPAddress
+        "Subnet Prefix"  = "$($_.PrefixLength)/32"
+        "Gateway"        = if ($Gateway) { $Gateway } else { "N/A" }
         "MAC Address"    = $Adapter.MacAddress
     }
 } | Format-Table -AutoSize
